@@ -1,0 +1,603 @@
+######################################################################
+# Raw check function created 03/2025 VVG
+# This script performs checks on raw data files, including:
+# - Delimiter detection
+# - Header and trailer identification
+# - Field consistency validation
+# - Summation of selected columns
+# - Handling of both text and Excel files
+#####################################################################
+
+filename="$1"  # File name
+col1="$2"      # Units/Sales/Returns to sum
+col2="$3"      # Units/Sales/Returns to sum
+col3="$4"      # Units/Sales/Returns to sum
+col4="$5"      # Units/Sales/Returns to sum
+
+#####################################################################
+# Function: excel_converter
+# Purpose: Convert an Excel (.xlsx) file into a text-based format
+# Inputs: File name
+# Output: A new file in a CSV format
+#####################################################################
+excel_converter(){
+    filename="$1"
+    
+    # Extract sheet_ids and sheet_names
+    sheet_ids=($(unzip -p "$filename" xl/workbook.xml | grep -o '<sheet[^>]*r:id="rId[0-9]*"' | grep -v "hidden" | grep -o 'rId[0-9]*' | grep -o '[0-9]*'))
+    hidden_tabs=($(unzip -p "$filename" xl/workbook.xml | grep -o '<sheet[^>]*r:id="rId[0-9]*"' | grep -o "hidden"))
+    mapfile -t sheet_names < <(unzip -p "$filename" xl/workbook.xml | grep -o '<sheet[^>]*r:id="rId[0-9]*"' | grep -v "hidden" | sed -E 's/.*name="([^"]*)".*/\1/')
+    if [[ ${#hidden_tabs[@]} -gt "0" ]]; then
+        echo "⚠️  Warning: ${#hidden_tabs[@]} hidden tabs detected."
+        echo ""
+    fi
+
+    # If there is only one sheet, automatically proceed
+    if [[ ${#sheet_ids[@]} -eq 1 ]]; then
+        selected_sheet_name="${sheet_names[0]}"
+        selected_sheet_id="${sheet_ids[0]}"
+        echo "Only one sheet found: $selected_sheet_name (ID: $selected_sheet_id). Proceeding with conversion."
+        read -p "Enter the delimiter: " selected_delimiter
+        csv_filename="${filename%.xlsx}_$selected_sheet_id.csv"
+        di_trifacta_xlsx2csv "$filename" "$csv_filename" "$selected_delimiter"
+        runnin_checks "$csv_filename"
+        return 0
+    else
+        # Display available sheets if there are multiple
+        echo "Available Sheets:"
+        echo "-----------------"
+        for i in "${!sheet_ids[@]}"; do
+            printf "%d: %s\n" "$((i+1))" "${sheet_names[$i]}"
+        done
+
+        while true; do
+            # Ask the user to select a sheet by name or enter 'all' to convert all non-hidden sheets
+            read -p "Enter the sheet name you would like to convert, or type 'all' to convert all non-hidden sheets: " selected_sheet_name
+            
+            if [[ "$selected_sheet_name" == "all" ]]; then
+                read -p "Enter the delimiter: " selected_delimiter
+                echo "Converting all non-hidden sheets..."
+                for id in "${!sheet_ids[@]}"; do
+                    current_sheet_id=${sheet_ids[$id]}
+                    echo "Converting sheet: ${sheet_names[$id]} (ID: ${sheet_ids[$id]})"
+                    csv_filename="${filename%.xlsx}_${sheet_ids[$id]}.csv"
+                    di_trifacta_xlsx2csv "$filename" "$csv_filename" "$selected_delimiter" "${sheet_ids[$id]}"
+                    runnin_checks "$csv_filename"
+                done
+                return 0
+            else
+                selected_sheet_id=""
+                for i in "${!sheet_names[@]}"; do
+                    if [[ "${sheet_names[$i]}" == "$selected_sheet_name" ]]; then
+                        selected_sheet_id="${sheet_ids[$i]}"
+                        break
+                    fi
+                done
+
+                if [[ -n "$selected_sheet_id" ]]; then
+                    read -p "Enter the delimiter: " selected_delimiter
+                    echo "You selected sheet: $selected_sheet_name (ID: $selected_sheet_id)"
+                    csv_filename="${filename%.xlsx}_${selected_sheet_id}.csv"
+                    di_trifacta_xlsx2csv "$filename" "$csv_filename" "$selected_delimiter" "$selected_sheet_id"
+                    runnin_checks "$csv_filename"
+                    return 0
+                else
+                    echo "Invalid sheet name. Please try again."
+                fi
+            fi
+        done
+    fi
+}
+
+#####################################################################
+# Function: delimiter_check
+# Purpose: Identifies the most common delimiter in the file.
+# Inputs: File name
+# Output: Detected delimiter stored in global variable 'best_delim'
+#####################################################################
+delimiter_check() {
+    local file="$1"
+    local limit=5
+    local num_of_lines_sample=0
+    local sample="sample.txt"
+    best_delim=""
+
+    # Detect encoding
+    local encoding
+    encoding=$(file -b --mime-encoding "$file")
+
+    # Global utf8_file only if needed
+    if [[ "$encoding" == "utf-16le" ]]; then
+        utf8_file="converted_utf8.txt"
+        iconv -f UTF-16LE -t UTF-8 "$file" > "$utf8_file"
+        file_to_use="$utf8_file"
+    else
+        file_to_use="$file"
+        utf8_file=""
+    fi
+
+    # Collect the first 5 non-empty lines from the file as a sample
+    while IFS= read -r line; do
+        line=$(echo "$line" | tr -d '\r') # Remove carriage returns
+        if [[ -n "$line" ]]; then
+            echo "$line" >> "$sample"
+            ((num_of_lines_sample++))
+        fi
+        [[ $num_of_lines_sample -eq $limit ]] && break
+    done < "$file_to_use"
+
+    if [[ $num_of_lines_sample -eq 0 ]]; then
+        echo "❌ Error: The file is empty or only includes empty lines!"
+        rm -f "$sample"
+        [[ -n "$utf8_file" ]] && rm -f "$utf8_file"
+        exit 1
+    fi
+
+    # Count occurrences of all potential delimiters (including tabs)
+    best_delim=$(grep -oP '[,;|~.:]' "$sample" | sort | uniq -c | sort -nr | awk 'NR==1 {print $2}')
+
+    # Count tab occurrences separately
+    tab_count=$(grep -oP '\t' "$sample" | wc -l)
+
+    if [[ "$tab_count" -gt "$(grep -oP "[${best_delim}]" "$sample" | wc -l)" ]]; then
+        best_delim="\\t"
+    fi
+
+    rm -f "$sample"
+
+    if [[ -z "$best_delim" ]]; then
+        echo "No delimiter detected"
+        exit 1
+    fi
+}
+#####################################################################
+# Function: header_check
+# Purpose: Identifies the header line in the file.
+# Inputs: File name, delimiter
+# Output: Header line index stored in 'header_line'
+#####################################################################
+header_check() {
+    local filename="$1"
+    local delimiter="$2"
+    header_line=1
+    local complete="false"
+    header_found="false"
+
+    if [[ -n "$utf8_file" && -s "$utf8_file" ]]; then
+        filename="$utf8_file"
+    fi
+
+    local num_of_lines=$(wc -l < "$filename")
+    echo "Please help me find the header or the first valid record! Header: y, First valid record: r, Neither: n"
+
+    # Only print the line, ask the user for the header confirmation, and break if found
+    while [[ $complete == "false" ]]; do
+        local current_line
+        current_line=$(sed -n "${header_line}p" "$filename")
+        if [[ $header_line -le $num_of_lines && (-z "$current_line" || "$current_line" =~ ^[$delimiter[:space:]]*$) ]]; then
+            ((header_line++))
+        else
+            if [[ $header_line -le $num_of_lines ]]; then
+                echo ""
+                sed -n "${header_line}p" "$filename"
+                echo ""
+                read -p "Is this the header? (y/r/n): " yrn
+                case $yrn in
+                    [Yy]* ) header_found="true"; complete="true"; echo "The header is in the ${header_line}. line.";;  
+                    [Rr]* ) header_found="false"; complete="true"; echo "The first valid record is in the ${header_line}. line.";;  
+                    [Nn]* ) ((header_line++));;
+                    * ) echo "Header: y, First valid record: r, Neither: n";;
+                esac
+            else
+                echo "❌ Error: No header found, please check the file."
+                exit 1
+            fi
+        fi
+    done
+}
+
+#####################################################################
+# Function: trailer_check
+# Purpose: Identifies the trailer line in the file.
+# Inputs: File name, delimiter
+# Output: Trailer line number stored in 'trailer_line'
+#####################################################################
+trailer_check() {
+    local filename="$1"
+    local delimiter="$2"
+    local complete="false"
+
+    if [[ -n "$utf8_file" && -s "$utf8_file" ]]; then
+        filename="$utf8_file"
+    fi
+
+    trailer_line=$(wc -l < "$filename")
+    trailer_found="false"
+    local last_line="1"
+    echo "Please help me find the trailer or the last valid record! Trailer: y, Last valid record: r, Neither: n"
+
+    # Only print the line, ask the user for the trailer confirmation, and break if found
+    while [[ $complete == "false" ]]; do
+        if [[ $trailer_line -ge $last_line ]]; then
+            local current_line
+            current_line=$(sed -n "${trailer_line}p" "$filename")
+        else
+            echo "❌ Error: No trailer found, please check the file."
+            exit 1
+        fi
+        if [[ $trailer_line -ge $last_line && (-z "$current_line" || "$current_line" =~ ^[$delimiter[:space:]]*$) ]]; then
+            ((trailer_line--))
+        else
+            if [[ $trailer_line -ge $last_line ]]; then
+                echo ""
+                sed -n "${trailer_line}p" "$filename"
+                echo ""
+                read -p "Is this the trailer? (y/r/n): " yrn
+                case $yrn in
+                    [Yy]* ) trailer_found="true"; complete="true"; echo "The trailer is in the ${trailer_line}. line.";;  
+                    [Rr]* ) trailer_found="false"; complete="true"; echo "The last valid record is in the ${trailer_line}. line.";;  
+                    [Nn]* ) ((trailer_line--));;
+                    * ) echo "Trailer: y, First valid record: r, Neither: n";;
+                esac
+            else
+                echo "❌ Error: No trailer found, please check the file."
+                exit 1
+            fi
+        fi
+    done
+}
+
+#####################################################################
+# Function: num_of_rec_check
+# Purpose: Calculates the number of records excluding header and trailer.
+# Inputs:
+# Output: Number of records 'num_of_rec'
+#####################################################################
+num_of_rec_check() {
+    num_of_rec=0
+
+    if [[ "$header_found" == "true" && "$trailer_found" == "true" ]]; then
+        num_of_rec=$((trailer_line - header_line - 1))
+    elif [[ ("$header_found" == "true" && "$trailer_found" == "false") || ("$header_found" == "false" && "$trailer_found" == "true") ]]; then
+        num_of_rec=$((trailer_line - header_line))
+    elif [[ "$header_found" == "false" && "$trailer_found" == "false" ]]; then
+        num_of_rec=$((trailer_line - header_line + 1))
+    fi
+
+    echo "Number of records (without header and trailer records): $num_of_rec"
+}
+
+#####################################################################
+# Function: check_field_consistency
+# Purpose: This function checks if all rows in the file have the same 
+#          number of fields (columns) based on the detected delimiter.
+#          It helps identify inconsistencies in the data structure,
+#          such as missing or extra fields in some rows.
+# Inputs: File name, delimiter, index of header, index of trailer
+# Output:
+#####################################################################
+check_field_consistency() {
+    local filename="$1"
+    local best_delim="$2"
+    local header_line="$3"
+    local trailer_line="$4"
+
+    if [[ -n "$utf8_file" && -s "$utf8_file" ]]; then
+        filename="$utf8_file"
+    fi
+
+    preprocessed_file="${filename}.tmp"
+    pre_preprocessed_file="${filename}.tmp2"
+    use_prep_file="false"
+
+    if [[ -z "${current_sheet_id}" ]]; then
+        local broken_records_file="broken_records.csv"
+        local missing_double_quotes_pair="missing_double_quotes_pair.csv"
+    else
+        local broken_records_file="broken_records_${current_sheet_id}.csv"
+        local missing_double_quotes_pair="missing_double_quotes_pair_${current_sheet_id}.csv"
+    fi
+
+    rerun_needed="false"
+
+    # Remove trailing carriage returns and leading/trailing quotes if entire line is wrapped
+    awk '{ gsub(/\r$/, ""); print }' "$filename" | awk '
+    {
+        line = $0;
+        if (substr(line, 1, 1) == "\"" && substr(line, length(line), 1) == "\"") {
+            line = substr(line, 2, length(line) - 2);
+        }
+        print line;
+    }' > "${pre_preprocessed_file}"
+
+    local warning_count=0
+    local unbalanced_quote_count=0
+
+    # Preprocess file and catch unbalanced double quotes
+    awk -v delim="${best_delim}" -v out_file="${missing_double_quotes_pair}" '
+    BEGIN {
+        count = 0;
+        unbalanced = 0;
+        print "Line Number, Record" > out_file;
+    }
+    {
+        line_num = NR;
+        num_quotes = gsub(/"/, "\"");
+
+        if (num_quotes % 2 != 0) {
+            unbalanced++;
+            print line_num "," $0 >> out_file;
+            print $0;
+            next;
+        }
+
+        output = "";
+        in_quotes = 0;
+        line_has_extra_delim = 0;
+
+        for (i = 1; i <= length($0); i++) {
+            char = substr($0, i, 1);
+            if (char == "\"") {
+                in_quotes = !in_quotes;
+            }
+            if (in_quotes && char == delim) {
+                char = "#";
+                line_has_extra_delim = 1;
+            }
+            output = output char;
+        }
+
+        if (line_has_extra_delim) count++;
+        print output;
+    }
+    END {
+        print "EXTRA_DELIM_WARNINGS=" count;
+        print "UNBALANCED_QUOTE_WARNINGS=" unbalanced;
+    }
+    ' "$pre_preprocessed_file" > "$preprocessed_file"
+
+    # Extract warnings
+    warning_count=$(tail -n2 "$preprocessed_file" | grep EXTRA_DELIM_WARNINGS | cut -d= -f2)
+    unbalanced_quote_count=$(tail -n1 "$preprocessed_file" | grep UNBALANCED_QUOTE_WARNINGS | cut -d= -f2)
+
+    # Clean the temp lines with warning metadata
+    sed -i '$d' "$preprocessed_file"
+    sed -i '$d' "$preprocessed_file"
+
+    # Field count check between header and trailer
+    if [[ "$header_found" == "true" && "$trailer_found" == "true" ]]; then
+        awk -F "$best_delim" -v start_line="$header_line" -v end_line="$trailer_line" 'NR > start_line && NR < end_line { print NF }' "$preprocessed_file" | sort | uniq -c > field_count.tmp
+    elif [[ "$header_found" == "true" && "$trailer_found" == "false" ]]; then
+        awk -F "$best_delim" -v start_line="$header_line" -v end_line="$trailer_line" 'NR > start_line && NR <= end_line { print NF }' "$preprocessed_file" | sort | uniq -c > field_count.tmp
+    elif [[ "$header_found" == "false" && "$trailer_found" == "true" ]]; then
+        awk -F "$best_delim" -v start_line="$header_line" -v end_line="$trailer_line" 'NR >= start_line && NR < end_line { print NF }' "$preprocessed_file" | sort | uniq -c > field_count.tmp
+    else
+        awk -F "$best_delim" -v start_line="$header_line" -v end_line="$trailer_line" 'NR >= start_line && NR <= end_line { print NF }' "$preprocessed_file" | sort | uniq -c > field_count.tmp
+    fi
+
+    # Summary
+    cat field_count.tmp
+    echo ""
+
+    # Warnings
+    if [[ "$warning_count" -gt 0 ]]; then
+        use_prep_file="true"
+        echo "⚠️ Warning: Found $warning_count lines with extra delimiters inside balanced double quotes."
+        echo ""
+    fi
+
+    if [[ "$unbalanced_quote_count" -gt 0 ]]; then
+        echo "⚠️ Warning: Found $unbalanced_quote_count lines with double quotes that have a missing pair in the given line."
+        echo "⚠️  These records have been saved to $missing_double_quotes_pair. Please review and fix them."
+        echo ""
+    fi
+
+    # Most common field count
+    local most_common_fields=$(sort -nr field_count.tmp | awk 'NR==1 {print $2}')
+    local unique_field_counts=$(wc -l < field_count.tmp)
+
+    # Inconsistencies
+    if [[ "$unique_field_counts" -gt 1 ]]; then
+        echo ""
+        echo "❌ Error: Found records with a different number of columns between header and trailer. Please fix the file."
+        echo ""
+
+        echo "Line Number, Record" > "$broken_records_file"
+        awk -F "$best_delim" -v start_line="$header_line" -v end_line="$trailer_line" -v most_common="$most_common_fields" 'NR >= start_line && NR <= end_line { if (NF != most_common) { print NR "," $0 } }' "$preprocessed_file" >> "$broken_records_file"
+
+        rerun_needed="true"
+        echo "⚠️  Broken records have been saved to $broken_records_file. Please review and fix them."
+        echo ""
+    fi
+
+    # Delete missing_double_quotes_pair file if it only contains the header
+    if [[ -f "$missing_double_quotes_pair" ]]; then
+        if [[ $(wc -l < "$missing_double_quotes_pair") -eq 1 ]]; then
+            rm "$missing_double_quotes_pair"
+        fi
+    fi
+
+    # Cleanup
+    if [[ "$use_prep_file" == "true" ]]; then
+        rm field_count.tmp "${pre_preprocessed_file}"
+    else
+        rm field_count.tmp "${pre_preprocessed_file}" "${preprocessed_file}"
+    fi
+}
+
+#####################################################################
+# Function: sum_func
+# Purpose: This function calculates the sum of values in two specified 
+#          columns of a file, helping to verify totals and detect 
+#          potential data inconsistencies.
+# Inputs: File name, first column, second column, delimiter
+# Output: Prints the total sum for both specified columns.
+#####################################################################
+sum_func() {
+    local filename="$1"  
+    local delimiter="$2"
+    local col1="$3"       # Required
+    local col2="$4"       # Optional
+    local col3="$5"       # Optional
+    local col4="$6"       # Optional
+
+    if [[ "$use_prep_file" == "false" ]]; then
+        if [[ -n "$utf8_file" && -s "$utf8_file" ]]; then
+            filename="$utf8_file"
+        fi
+    fi
+
+    awk -F "$delimiter" -v c1="$col1" -v c2="$col2" -v c3="$col3" -v c4="$col4" '
+        function normalize_number(n) {
+            gsub(/^[ \t]+|[ \t]+$/, "", n)  # Trim spaces
+            gsub(/\r/, "", n)  # Remove carriage return
+
+            # Check if the number is negative
+            is_negative = (n ~ /^-/) ? 1 : 0
+            if (is_negative) {
+                gsub(/^-/, "", n)  # Remove the negative sign for processing
+            }
+
+            # Find the last separator (. or ,)
+            last_sep_pos = match(n, /[.,][0-9]*$/)
+            last_sep = last_sep_pos ? substr(n, RSTART, 1) : ""
+
+            # If the last separator is followed by exactly 3 digits → thousands separator
+            if (last_sep_pos && length(substr(n, RSTART + 1)) == 3) {
+                gsub("[.,]", "", n)
+            }
+            # If the last separator is followed by a decimal pattern
+            else {
+                if (last_sep == ",") {
+                    gsub("\\.", "", n)  # Remove thousands separators (.)
+                    gsub(",", ".", n)   # Convert decimal (,) to (.)
+                } else {
+                    gsub(",", "", n)  # Remove thousands separators (,)
+                }
+            }
+
+            if (n ~ /^[0-9.]+$/) {
+                n = n + 0
+            } else {
+                n = 0
+            }
+
+            # Restore the negative sign if needed
+            if (is_negative) {
+                n = -n
+            }
+
+            return n;
+        }
+
+        {
+            if (NF < c1 || (c2 && NF < c2) || (c3 && NF < c3) || (c4 && NF < c4)) {
+                print "Skipping line due to missing columns:", $0;
+                next
+            }
+
+            sum1 += normalize_number($c1)
+            if (c2) sum2 += normalize_number($c2)
+            if (c3) sum3 += normalize_number($c3)
+            if (c4) sum4 += normalize_number($c4)
+        }
+
+        END {
+            printf "Final sum of column %d is %.2f\n", c1, sum1
+            if (c2) printf "Final sum of column %d is %.2f\n", c2, sum2
+            if (c3) printf "Final sum of column %d is %.2f\n", c3, sum3
+            if (c4) printf "Final sum of column %d is %.2f\n", c4, sum4
+        }
+    ' "$filename"
+}
+#####################################################################
+# Function: runnin_checks
+# Purpose: Runs all checks sequentially for a file.
+# Inputs: File name
+# Output: Prints various file properties and validation results.
+#####################################################################
+runnin_checks(){
+    conv_filename="$1"
+
+    delimiter_check "$conv_filename"
+    echo "Detected delimiter: '$best_delim'"
+    echo ""
+
+    echo "Header for $conv_filename:"
+    echo ""
+    header_check "$conv_filename" "$best_delim"
+    echo ""
+
+    echo "Trailer for $conv_filename:"
+    echo ""
+    trailer_check "$conv_filename" "$best_delim"
+    echo ""
+
+    echo "Charset for $conv_filename:"
+    file -i "$conv_filename" | awk -F'=' '{print $2}'
+    echo ""
+
+    echo "Line ender for $conv_filename:"
+    head -2 "$conv_filename" | od -An -tc | tail -1 | sed 's/ //g'
+    echo ""
+
+    num_of_rec_check
+    echo ""
+
+    echo "Checking the number of fields..."
+    check_field_consistency "$conv_filename" "$best_delim" "$header_line" "$trailer_line"
+    echo ""
+
+    # If broken records are found, skip summarizing and prompt user to fix the file
+    if [[ "$rerun_needed" == "true" && -n "$col1" ]]; then  # If check_field_consistency returns an error (broken record)
+        echo "⚠️  Warning: Broken records detected."
+        echo "Skipping the summarizing part due to broken records."
+    else
+        # Only run the sum check if there are no broken records
+        if [[ -n "$col1" && -n "$col2" && -n "$col3" && -n "$col4" ]]; then
+            if [[ "$use_prep_file" == "true" ]]; then
+                sum_func "$preprocessed_file" "$best_delim" "$col1" "$col2" "$col3" "$col4"
+            else
+                sum_func "$conv_filename" "$best_delim" "$col1" "$col2" "$col3" "$col4"
+            fi
+        elif [[ -n "$col1" && -n "$col2" && -n "$col3" ]]; then
+            if [[ "$use_prep_file" == "true" ]]; then
+                sum_func "$preprocessed_file" "$best_delim" "$col1" "$col2" "$col3"
+            else
+                sum_func "$conv_filename" "$best_delim" "$col1" "$col2" "$col3"
+            fi
+        elif [[ -n "$col1" && -n "$col2" ]]; then
+            if [[ "$use_prep_file" == "true" ]]; then
+                sum_func "$preprocessed_file" "$best_delim" "$col1" "$col2"
+            else
+                sum_func "$conv_filename" "$best_delim" "$col1" "$col2"
+            fi
+        elif [[ -n "$col1" ]]; then
+            if [[ "$use_prep_file" == "true" ]]; then
+                sum_func "$preprocessed_file" "$best_delim" "$col1"
+            else
+                sum_func "$conv_filename" "$best_delim" "$col1"
+            fi
+        fi
+    fi
+    
+    if [[ -n "${preprocessed_file}" && -f "${preprocessed_file}" ]]; then
+        rm "${preprocessed_file}"
+    elif [[ -n "${utf8_file}" && -f "${utf8_file}" ]]; then
+        rm "${utf8_file}"
+    fi
+}
+
+#####################################################################
+# Main Execution Flow
+# Calls the necessary checks based on file type.
+#####################################################################
+if [[ "$filename" == *.xlsx* ]]; then
+    echo "Excel file detected. Processing sheets..."
+    echo ""
+    excel_converter "$filename"
+else
+    echo "Non-Excel file detected. Running standard checks..."
+    echo ""
+    runnin_checks "$filename"
+fi
